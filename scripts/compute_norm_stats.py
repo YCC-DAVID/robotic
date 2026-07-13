@@ -13,6 +13,12 @@ import torch.multiprocessing as mp
 import torch
 import torch.distributed as dist
 
+# Share worker tensors via /tmp files instead of file descriptors. The default
+# file_descriptor strategy exhausts the per-process mmap/fd limit over the many
+# small batches returned by the Pool, causing "unable to mmap ... Cannot allocate
+# memory (12)" stalls on this cluster.
+mp.set_sharing_strategy("file_system")
+
 from lingbotvla.data import build_vla_dataset
 from lingbotvla.utils.normalize import (
     RunningStats,
@@ -82,9 +88,13 @@ def collate_dict(batch_list):
     keys = batch_list[0].keys()
     batch = {}
     for key in keys:
-        # If it is a Tensor, stack them together
+        # If it is a Tensor, stack them together. Return numpy so Pool workers
+        # pass results as plain pickled bytes through the pipe instead of torch
+        # shared-memory mmaps, which otherwise exhaust the per-process mmap limit
+        # (vm.max_map_count) and stall with "unable to mmap ... Cannot allocate
+        # memory (12)" partway through the dataset.
         if isinstance(batch_list[0][key], torch.Tensor):
-            batch[key] = torch.stack([item[key] for item in batch_list])
+            batch[key] = torch.stack([item[key] for item in batch_list]).numpy()
     return batch
 
 # Worker logic - use an initializer to avoid passing the entire dataset with every task

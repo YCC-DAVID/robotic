@@ -1,0 +1,42 @@
+# ==== 大文件 / 权重 / 数据 —— 绝不入库 ====
+pretrained/
+datasets/
+output/
+tmp/
+hf_cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# ==== 运行产物 / 日志 ====
+log.txt
+*.log
+**/logs/
+*.out
+experiment/**/logs/
+open_loop_test/
+open_loop_eval/
+wandb/
+runs/
+
+# ==== Python ====
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# ==== 环境 / 编辑器 ====
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.DS_Store

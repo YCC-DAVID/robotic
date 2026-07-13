@@ -1,0 +1,2 @@
+stackcubes /scratch/cy65664/workDir/lingbot-vla-v2/datasets/Stack-the-cubes
+stackcubes /scratch/cy65664/workDir/lingbot-vla-v2/datasets/Stack-the-cubes-v2
