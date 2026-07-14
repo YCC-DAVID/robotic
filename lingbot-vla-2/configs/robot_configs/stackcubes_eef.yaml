@@ -1,0 +1,48 @@
+# Unitree G1 Dex1 (Sim) - Stack-the-cubes, EEF (end-effector) action space.
+# Version B: mixed (v1+v2) datasets converted joint->EEF via pinocchio FK
+# (scripts/joint_to_eef.py, g1_body29_hand14.urdf, L_ee/R_ee = wrist_yaw + 0.05m x,
+#  pelvis frame). Absolute EEF pose (subtract_state: False), matching the openpi
+# pi05_g1_eef client (g1-client/openpi/main_eef.py) which runs IK on the returned poses.
+#
+# EEF-space observation.state / action layout (16 dims):
+#   [0:7)   left  EEF pose  (x, y, z, qx, qy, qz, qw)   pelvis frame, quat xyzw
+#   [7:14)  right EEF pose  (x, y, z, qx, qy, qz, qw)
+#   [14:15) left gripper
+#   [15:16) right gripper
+states:
+  - observation.state.end.position:      # 14 = L pose7 + R pose7
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 14
+
+  - observation.state.effector.position: # 2 grippers
+      origin_keys:
+        - observation.state:
+            start: 14
+            end: 16
+
+actions:
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 14
+      subtract_state: False               # absolute EEF pose (no relative transform)
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 14
+            end: 16
+      subtract_state: False
+
+images:
+  - observation.images.camera_top:
+      origin_keys: observation.images.cam_left_high
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.cam_left_wrist
+  - observation.images.camera_wrist_right:
+      origin_keys: observation.images.cam_right_wrist
+
+norm_stats: assets/norm_stats/stackcubes_eef.json
