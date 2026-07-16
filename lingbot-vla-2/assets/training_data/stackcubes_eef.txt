@@ -1,0 +1,2 @@
+stackcubes_eef /scratch/cy65664/workDir/lingbot-vla-v2/datasets/Stack-the-cubes-eef
+stackcubes_eef /scratch/cy65664/workDir/lingbot-vla-v2/datasets/Stack-the-cubes-v2-eef

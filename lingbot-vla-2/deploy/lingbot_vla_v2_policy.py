@@ -196,6 +196,10 @@ class LingbotVLAv2Server:
         use_bf16=True,
         use_fp32=False,
         use_compile=False,
+        robo_name=None,
+        smooth='none',
+        smooth_window=7,
+        smooth_alpha=0.4,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -203,6 +207,19 @@ class LingbotVLAv2Server:
         self.use_length = use_length
         self.chunk_ret = chunk_ret
         self.robot_norm_path = robot_norm_path
+        # Server-side action-chunk smoothing. The model's raw chunks carry
+        # ~mm-level 30Hz jitter (measured 17.7x the demo's accel RMS); since
+        # the server returns whole chunks it can zero-phase filter them
+        # (savgol), which a causal client-side filter cannot do without lag.
+        assert smooth in ('none', 'savgol', 'ema'), smooth
+        self.smooth_mode = smooth
+        self.smooth_window = smooth_window
+        self.smooth_alpha = smooth_alpha
+        self.quat_slices = []   # filled by reset() from the robot config
+        # openpi-client compatibility: lets a stateless client (e.g. g1-client
+        # openpi/main_eef.py, which never sends a reset handshake) work — the
+        # first infer auto-resets with this robot config.
+        self.default_robo_name = robo_name
 
         self.task_description = None
 
@@ -225,14 +242,34 @@ class LingbotVLAv2Server:
         self.action_key: str= "action"
 
     def load_model_weights(self, path_to_pi_model, strict=True):
-        all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
-        merged_weights = {}
+        # GPU-first loading. The old path (read every shard to CPU RAM, copy
+        # 1700+ bf16 tensors into an fp32 CPU model with per-tensor dtype
+        # conversion, convert the whole model back to bf16, then .cuda())
+        # burned all CPU cores for minutes — >20 min on slow/contended nodes,
+        # and hot enough to thermal-throttle a workstation. Instead: move the
+        # (still randomly-initialized) model to its serving dtype/device
+        # first, then stream each shard straight onto the device. Loading
+        # shard-by-shard keeps peak device memory at model + one shard.
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.vla = self.vla.to(torch.bfloat16)
+        if device == 'cuda':
+            self.vla = self.vla.cuda()
 
+        all_safetensors = sorted(glob(os.path.join(path_to_pi_model, "*.safetensors")))
+        expected = set(self.vla.state_dict().keys())
+        loaded = set()
         for file_path in tqdm(all_safetensors):
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    merged_weights[key] = f.get_tensor(key)
-        self.vla.load_state_dict(merged_weights, strict=strict)
+            shard = load_file(file_path, device=device)
+            self.vla.load_state_dict(shard, strict=False)
+            loaded.update(shard.keys())
+            del shard
+        if strict:
+            missing = expected - loaded
+            unexpected = loaded - expected
+            assert not missing and not unexpected, (
+                f"checkpoint/model key mismatch: missing={sorted(missing)[:5]} "
+                f"unexpected={sorted(unexpected)[:5]} "
+                f"(+{max(len(missing), len(unexpected))} more)")
 
     def merge_qwen_config(self, qwen_config):
         if hasattr(qwen_config, 'to_dict'):
@@ -360,14 +397,41 @@ class LingbotVLAv2Server:
         # Load data processors
         self.vla.feature_transform = feature_transform
         self.action_key = feature_transform.org_features["actions"]
+
+        # Locate quaternion blocks in the output layout so smoothing can
+        # re-normalize them: every 'end.position' action feature is a run of
+        # pose7 blocks (x,y,z,qx,qy,qz,qw) within its origin span.
+        self.quat_slices = []
+        for feat in self.robot_config.get('actions', []):
+            if not isinstance(feat, dict):
+                continue
+            name = next(iter(feat.keys()))
+            if 'end.position' not in name:
+                continue
+            for origin in feat[name].get('origin_keys', []):
+                for _, info in origin.items():
+                    start, end = info.get('start', 0), info.get('end', 0)
+                    for base in range(start, end - 6, 7):
+                        self.quat_slices.append(slice(base + 3, base + 7))
     def resize_image(self, observation):
         image_features  = self.vla.feature_transform.org_features['images']
         image_size = getattr(self.data_config, 'img_size', 256)
         resize = Resize((image_size, image_size))
         for image_feature in image_features:
             assert image_feature in observation
-            assert len(observation[image_feature].shape)==3 and observation[image_feature].shape[-1] == 3
-            image = torch.as_tensor(observation[image_feature]).permute(2, 0, 1).contiguous()
+            img = observation[image_feature]
+            # openpi-client compatibility: g1-client's --send-jpeg ships the
+            # camera frames as JPEG bytes (BGR-encoded, q90) instead of a
+            # decoded RGB array — decode them server-side.
+            if isinstance(img, (bytes, bytearray, memoryview)):
+                import cv2
+                bgr = cv2.imdecode(np.frombuffer(img, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if bgr is None:
+                    raise ValueError(f"cv2.imdecode failed on JPEG bytes for {image_feature}")
+                img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            assert len(img.shape)==3 and img.shape[-1] == 3, \
+                f"{image_feature}: expected HWC RGB uint8 (or JPEG bytes), got shape {getattr(img, 'shape', type(img))}"
+            image = torch.as_tensor(img).permute(2, 0, 1).contiguous()
             image = image.to(dtype=torch.float32)
             observation[image_feature] = resize(image)
 
@@ -398,9 +462,36 @@ class LingbotVLAv2Server:
 
         return action_chunk
 
+    def _smooth_chunk(self, arr):
+        """Zero-phase smoothing of an unnormalized action chunk (B, K, D)
+        along K, then re-normalize any quaternion blocks."""
+        K = arr.shape[1]
+        if self.smooth_mode == 'none' or K < 5:
+            return arr
+        if self.smooth_mode == 'savgol':
+            from scipy.signal import savgol_filter
+            w = min(self.smooth_window, K)
+            if w % 2 == 0:
+                w -= 1
+            out = savgol_filter(arr, window_length=w, polyorder=2, axis=1)
+        else:  # ema (causal; kept for comparison)
+            a = self.smooth_alpha
+            out = arr.astype(np.float64).copy()
+            for t in range(1, K):
+                out[:, t] = (1.0 - a) * out[:, t - 1] + a * arr[:, t]
+        out = out.astype(arr.dtype, copy=False)
+        for sl in self.quat_slices:
+            q = out[:, :, sl]
+            out[:, :, sl] = q / np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-8, None)
+        return out
+
     def _prepare_model_input(self, observation):
         # not modify input observation
         observation = dict(observation)
+        # openpi clients send the language instruction under "prompt";
+        # our pipeline reads it as "task" (pad_and_concat). Accept both.
+        if 'task' not in observation and 'prompt' in observation:
+            observation['task'] = observation['prompt']
         self.resize_image(observation)
         for k, v in list(observation.items()):
             if isinstance(v, np.ndarray):
@@ -464,8 +555,18 @@ class LingbotVLAv2Server:
         # IMPORTANT: Let's say crop scale == 0.9. To get the new height and width (post-crop), multiply
         #            the original height and width by sqrt(0.9) -- not 0.9!
         if 'reset' in observation and observation['reset']:
-            self.reset(robo_name=observation['robo_name'], path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
+            robo = observation.get('robo_name', self.default_robo_name)
+            assert robo is not None, "reset needs 'robo_name' in the request, or start the server with --robo_name"
+            self.reset(robo_name=robo, path_to_pi_model=observation['path_to_pi_model'] if 'path_to_pi_model' in observation else None)
             return dict(action = None)
+
+        # openpi-client compatibility: stateless clients never send a reset
+        # handshake — auto-reset on the first real observation.
+        if self.vla.feature_transform is None:
+            robo = observation.get('robo_name', self.default_robo_name)
+            assert robo is not None, ("first request must carry 'robo_name', "
+                                      "or start the server with --robo_name")
+            self.reset(robo_name=robo)
 
         is_batch = 'batch' in observation
         observations = observation['batch'] if is_batch else [observation]
@@ -495,7 +596,11 @@ class LingbotVLAv2Server:
                 if normalized_actions is not None:
                     assert self.use_length <= normalized_actions.shape[1]
                     normalized_actions = normalized_actions[:, :self.use_length]
-            
+
+            if self.smooth_mode != 'none':
+                for output_key in unnormalized_actions.keys():
+                    unnormalized_actions[output_key] = self._smooth_chunk(unnormalized_actions[output_key])
+
             self.last_action_chunk = unnormalized_actions  # always (B, chunk, dim)
             self.last_normalized_action_chunk = normalized_actions
 
@@ -524,8 +629,15 @@ class LingbotVLAv2Server:
             result = dict(result)
             result["_normalized_actions"] = normalized_action
 
+        # openpi-client compatibility: openpi's wire contract keys the action
+        # chunk as "actions" (g1-client main_eef.py reads result["actions"]).
+        # Alias it when there is a single unambiguous action key.
+        if "actions" not in result and len(self.action_key) == 1:
+            result = dict(result)
+            result["actions"] = result[next(iter(self.action_key))]
+
         self.global_step += 1
-        
+
         return result
 
 def str2bool(v):
@@ -578,6 +690,28 @@ def main():
         default=True,
     )
 
+    parser.add_argument(
+        "--robo_name",
+        type=str,
+        default=None,
+        help="robot config name (configs/robot_configs/<name>.yaml) used to "
+             "auto-reset on the first request from a stateless openpi client "
+             "(e.g. g1-client main_eef.py, which never sends a reset handshake)",
+    )
+
+    parser.add_argument(
+        "--smooth",
+        type=str,
+        default="none",
+        choices=["none", "savgol", "ema"],
+        help="server-side zero-phase smoothing of each returned action chunk "
+             "(savgol recommended; damps the model's high-frequency jitter)",
+    )
+    parser.add_argument("--smooth_window", type=int, default=7,
+                        help="savgol window length in steps (odd; ~0.23s at 30fps)")
+    parser.add_argument("--smooth_alpha", type=float, default=0.4,
+                        help="ema coefficient (only for --smooth ema)")
+
     args = parser.parse_args()
 
     model = LingbotVLAv2Server(
@@ -587,6 +721,10 @@ def main():
         use_bf16=True,
         use_fp32=False,
         use_compile=args.use_compile,
+        robo_name=args.robo_name,
+        smooth=args.smooth,
+        smooth_window=args.smooth_window,
+        smooth_alpha=args.smooth_alpha,
     )
     model_server = WebsocketPolicyServer(model, port=args.port)
     model_server.serve_forever()
